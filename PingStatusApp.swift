@@ -58,9 +58,13 @@ final class PingMonitor: ObservableObject {
     private static let defaultHost = "google.com"
     static let interval: TimeInterval = 5
 
-    /// Host to ping. Override for testing with
-    /// `defaults write dev.mm.pingstatus Host 127.0.0.1`
-    let host: String
+    /// Built-in choices offered in the popover picker.
+    static let presetHosts = ["google.com", "claude.ai", "x.com"]
+
+    /// Host to ping. The current value persists in UserDefaults (`Host`);
+    /// override for testing with `defaults write dev.mm.pingstatus Host 127.0.0.1`.
+    /// Anything outside `presetHosts` is treated as a custom host.
+    @Published private(set) var host: String
 
     // MARK: Published state (main thread only)
 
@@ -81,6 +85,9 @@ final class PingMonitor: ObservableObject {
     /// Set while a ping is in flight so overlapping attempts are skipped
     /// (e.g. if a ping somehow outlives `interval`). Main thread only.
     private var isPinging = false
+    /// Bumped on every `pingNow()` and on host changes; a completion whose
+    /// generation no longer matches is stale and triggers a re-ping.
+    private var pingGeneration = 0
     private var timer: Timer?
     private let pingQueue = DispatchQueue(label: "dev.mm.pingstatus.ping", qos: .utility)
 
@@ -100,6 +107,37 @@ final class PingMonitor: ObservableObject {
     }
 
     // MARK: Control
+
+    /// Switches the ping target, persists it, and re-checks immediately.
+    /// A ping still in flight for the old host is discarded (generation
+    /// mismatch) so its result can never be attributed to the new host.
+    func setHost(_ rawHost: String) {
+        let newHost = Self.sanitizeHost(rawHost)
+        guard !newHost.isEmpty, newHost != host else { return }
+        host = newHost
+        UserDefaults.standard.set(newHost, forKey: "Host")
+        pingGeneration += 1
+        state = .checking
+        consecutiveFailures = 0
+        failureDescription = nil
+        lastResponseMillis = nil
+        lastSuccessDate = nil
+        pingNow()
+    }
+
+    /// Trims pasted URLs down to a bare host: strips whitespace, an optional
+    /// http(s):// scheme, and any path or query suffix.
+    private static func sanitizeHost(_ raw: String) -> String {
+        var host = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for scheme in ["https://", "http://"]
+        where host.lowercased().hasPrefix(scheme) {
+            host = String(host.dropFirst(scheme.count))
+        }
+        if let slash = host.firstIndex(of: "/") {
+            host = String(host[..<slash])
+        }
+        return host.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     /// Starts the repeating ping timer and fires the first ping immediately.
     func start() {
@@ -121,11 +159,20 @@ final class PingMonitor: ObservableObject {
     func pingNow() {
         guard !isPinging else { return }
         isPinging = true
+        pingGeneration += 1
+        let generation = pingGeneration
+        let currentHost = host
         pingQueue.async { [weak self] in
-            let outcome = Self.performPing(host: self?.host ?? Self.defaultHost)
+            let outcome = Self.performPing(host: currentHost)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isPinging = false
+                guard generation == self.pingGeneration else {
+                    // The host changed while this ping was in flight; its
+                    // result is stale — immediately re-ping the new host.
+                    self.pingNow()
+                    return
+                }
                 self.apply(outcome, at: Date())
             }
         }
@@ -316,8 +363,17 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
 
 // MARK: - Popover content (SwiftUI)
 
+/// The picker's selection: one of the presets, or free-form entry.
+enum HostChoice: Hashable {
+    case preset(String)
+    case custom
+}
+
 struct StatusPopoverView: View {
     @EnvironmentObject private var monitor: PingMonitor
+
+    @State private var selection: HostChoice = .preset(PingMonitor.presetHosts[0])
+    @State private var customHostText = ""
 
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -329,6 +385,8 @@ struct StatusPopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+            Divider()
+            hostPicker
             Divider()
             detailRows
             Divider()
@@ -343,6 +401,7 @@ struct StatusPopoverView: View {
         }
         .padding(16)
         .frame(width: 280)
+        .onAppear { alignSelectionWithMonitor() }
     }
 
     private var header: some View {
@@ -356,9 +415,75 @@ struct StatusPopoverView: View {
         }
     }
 
+    // MARK: Host picker
+
+    private var hostPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Ping target")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Picker("Ping target", selection: selectionBinding) {
+                ForEach(PingMonitor.presetHosts, id: \.self) { host in
+                    Text(host).tag(HostChoice.preset(host))
+                }
+                Text("Custom…").tag(HostChoice.custom)
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if selection == .custom {
+                HStack(spacing: 8) {
+                    TextField("example.com or 1.1.1.1", text: $customHostText)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(saveCustomHost)
+                    Button("Save", action: saveCustomHost)
+                        .disabled(trimmedCustomHost.isEmpty)
+                }
+            }
+        }
+        .font(.callout)
+    }
+
+    /// Selecting a preset applies it immediately; selecting Custom… waits
+    /// for the text field (Return or Save).
+    private var selectionBinding: Binding<HostChoice> {
+        Binding(
+            get: { selection },
+            set: { newValue in
+                selection = newValue
+                if case .preset(let host) = newValue {
+                    monitor.setHost(host)
+                }
+            }
+        )
+    }
+
+    private var trimmedCustomHost: String {
+        customHostText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func saveCustomHost() {
+        let host = trimmedCustomHost
+        guard !host.isEmpty else { return }
+        monitor.setHost(host)
+    }
+
+    /// Mirrors the persisted host into the picker: a preset if it matches,
+    /// otherwise Custom… with the stored value shown in the text field.
+    private func alignSelectionWithMonitor() {
+        if let preset = PingMonitor.presetHosts.first(where: { $0 == monitor.host }) {
+            selection = .preset(preset)
+            customHostText = ""
+        } else {
+            selection = .custom
+            customHostText = monitor.host
+        }
+    }
+
+    // MARK: Detail rows
+
     private var detailRows: some View {
         VStack(alignment: .leading, spacing: 6) {
-            row("Host") { Text(monitor.host) }
             row("Response") {
                 if let millis = monitor.lastResponseMillis {
                     Text(String(format: "%.1f ms", millis))

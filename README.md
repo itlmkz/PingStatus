@@ -41,9 +41,11 @@ reaches the internet and comes back — the thing you actually care about.
 | Disconnected | red `circle` |
 | Checking (startup) | gray `circle.dashed` |
 
-- **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~450 lines
-- **Click the dot** for a popover: connection status, host, response time
-  (ms), last-check / last-success timestamps, failure count and reason
+- **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~500 lines
+- **Click the dot** for a popover: pick the ping target (google.com,
+  claude.ai, x.com, or a custom host/IP stored locally), see connection
+  status, response time (ms), last-check / last-success timestamps,
+  failure count and reason
 - Pings every 5 s via macOS's own `/sbin/ping` in a background process
 - **Pure menu bar app** — `LSUIElement = true`, never appears in the Dock
 - Tiny: ad-hoc signed `.app` bundle you build yourself in seconds
@@ -84,8 +86,19 @@ make clean
 
 ## Configuration
 
-By default the app pings `google.com` every 5 s. To watch a different host
-(your VPN's gateway, your own server, `1.1.1.1`…):
+Click the menu bar dot and pick a **Ping target** from the dropdown:
+
+- `google.com` (default)
+- `claude.ai`
+- `x.com`
+- **Custom…** — type any host or IP (e.g. `1.1.1.1` or your VPN gateway)
+  and hit Return or Save
+
+The choice is stored locally (UserDefaults) and survives relaunches.
+Selecting a target re-checks immediately. Pasted URLs are sanitized
+automatically — `https://example.com/foo` becomes `example.com`.
+
+You can also set it from the terminal:
 
 ```bash
 # Bundled app — override persists via the bundle identifier:
