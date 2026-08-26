@@ -4,10 +4,14 @@
 # PingStatus — single-file macOS menu bar app
 APP_NAME   := PingStatus
 SRC        := PingStatusApp.swift
+ICON_SRC   := AppIcon.png
 BUILD_DIR  := build
 APP_BUNDLE := $(BUILD_DIR)/$(APP_NAME).app
 CONTENTS   := $(APP_BUNDLE)/Contents
 MACOS_DIR  := $(CONTENTS)/MacOS
+RESOURCES  := $(CONTENTS)/Resources
+ICONSET    := $(BUILD_DIR)/AppIcon.iconset
+ICNS       := $(RESOURCES)/AppIcon.icns
 BINARY     := $(MACOS_DIR)/$(APP_NAME)
 STAMP      := $(BUILD_DIR)/.built
 
@@ -16,7 +20,7 @@ STAMP      := $(BUILD_DIR)/.built
 ## Build build/PingStatus.app (ad-hoc signed, LSUIElement = true).
 app: $(STAMP)
 
-$(STAMP): $(BINARY) $(CONTENTS)/Info.plist
+$(STAMP): $(BINARY) $(CONTENTS)/Info.plist $(ICNS)
 	codesign --force --sign - "$(APP_BUNDLE)"
 	@touch "$@"
 	@echo "Built $(APP_BUNDLE)"
@@ -30,6 +34,25 @@ $(BINARY): $(SRC)
 $(CONTENTS)/Info.plist: Info.plist
 	@mkdir -p "$(CONTENTS)"
 	cp "$<" "$@"
+
+## App icon: generate all required sizes from AppIcon.png (sips), then
+## pack them into AppIcon.icns (iconutil). Both ship with macOS — no
+## external dependencies.
+$(ICNS): $(ICON_SRC)
+	@mkdir -p "$(ICONSET)" "$(RESOURCES)"
+	@sips -z 16 16       "$<" --out "$(ICONSET)/icon_16x16.png"      >/dev/null
+	@sips -z 32 32       "$<" --out "$(ICONSET)/icon_16x16@2x.png"   >/dev/null
+	@sips -z 32 32       "$<" --out "$(ICONSET)/icon_32x32.png"      >/dev/null
+	@sips -z 64 64       "$<" --out "$(ICONSET)/icon_32x32@2x.png"   >/dev/null
+	@sips -z 128 128     "$<" --out "$(ICONSET)/icon_128x128.png"    >/dev/null
+	@sips -z 256 256     "$<" --out "$(ICONSET)/icon_128x128@2x.png" >/dev/null
+	@sips -z 256 256     "$<" --out "$(ICONSET)/icon_256x256.png"    >/dev/null
+	@sips -z 512 512     "$<" --out "$(ICONSET)/icon_256x256@2x.png" >/dev/null
+	@sips -z 512 512     "$<" --out "$(ICONSET)/icon_512x512.png"    >/dev/null
+	@sips -z 1024 1024   "$<" --out "$(ICONSET)/icon_512x512@2x.png" >/dev/null
+	@iconutil -c icns -o "$@" "$(ICONSET)"
+	@touch -c "$(APP_BUNDLE)" 2>/dev/null || true
+	@echo "Icon $(ICNS)"
 
 ## Run the bundled app (launchd-managed; LSUIElement hides the Dock icon).
 run: app

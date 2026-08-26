@@ -19,6 +19,7 @@
 
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 // MARK: - Model
@@ -56,7 +57,11 @@ final class PingMonitor: ObservableObject {
 
     private static let pingExecutablePath = "/sbin/ping"
     private static let defaultHost = "google.com"
-    static let interval: TimeInterval = 5
+
+    /// Seconds between pings. Persisted (`IntervalSeconds`), default 5;
+    /// set from the popover's frequency editor (seconds / per minute /
+    /// per hour), always snapped to an integer number of seconds.
+    @Published private(set) var interval: TimeInterval = 5
 
     /// Built-in choices offered in the popover picker.
     static let presetHosts = ["google.com", "claude.ai", "x.com"]
@@ -100,6 +105,10 @@ final class PingMonitor: ObservableObject {
         self.host = host
             ?? UserDefaults.standard.string(forKey: "Host")
             ?? Self.defaultHost
+        let storedInterval = UserDefaults.standard.integer(forKey: "IntervalSeconds")
+        if (1...3600).contains(storedInterval) {
+            interval = TimeInterval(storedInterval)
+        }
     }
 
     deinit {
@@ -125,6 +134,25 @@ final class PingMonitor: ObservableObject {
         pingNow()
     }
 
+    /// Updates the ping cadence in whole seconds (clamped to 1...3600),
+    /// persists it, and reschedules the timer on the new cadence.
+    func setInterval(seconds: Int) {
+        let clamped = min(max(seconds, 1), 3600)
+        guard clamped != Int(interval) else { return }
+        interval = TimeInterval(clamped)
+        UserDefaults.standard.set(clamped, forKey: "IntervalSeconds")
+        rescheduleTimer()
+    }
+
+    /// Replaces the repeating timer, keeping the current cadence. The next
+    /// tick fires one full interval from now.
+    private func rescheduleTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.pingNow()
+        }
+    }
+
     /// Trims pasted URLs down to a bare host: strips whitespace, an optional
     /// http(s):// scheme, and any path or query suffix.
     private static func sanitizeHost(_ raw: String) -> String {
@@ -143,7 +171,7 @@ final class PingMonitor: ObservableObject {
     func start() {
         guard timer == nil else { return }
         pingNow()
-        timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.pingNow()
         }
     }
@@ -369,11 +397,34 @@ enum HostChoice: Hashable {
     case custom
 }
 
+/// Frequency entry units offered in the popover. Whatever the user picks,
+/// the resulting interval is snapped to whole seconds (min 1 s, max 1 h).
+enum FrequencyUnit: String, CaseIterable, Identifiable {
+    case seconds = "seconds"
+    case perMinute = "per minute"
+    case perHour = "per hour"
+
+    var id: String { rawValue }
+
+    /// Integer seconds for `count` checks in this unit, rounded to the
+    /// nearest whole second (never below 1 s).
+    func seconds(forCount count: Int) -> Int {
+        switch self {
+        case .seconds: return max(1, count)
+        case .perMinute: return max(1, Int((60.0 / Double(count)).rounded()))
+        case .perHour: return max(1, Int((3600.0 / Double(count)).rounded()))
+        }
+    }
+}
+
 struct StatusPopoverView: View {
     @EnvironmentObject private var monitor: PingMonitor
 
     @State private var selection: HostChoice = .preset(PingMonitor.presetHosts[0])
     @State private var customHostText = ""
+    @State private var loginItemEnabled = false
+    @State private var frequencyCount = ""
+    @State private var frequencyUnit: FrequencyUnit = .seconds
 
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -388,6 +439,8 @@ struct StatusPopoverView: View {
             Divider()
             hostPicker
             Divider()
+            settingsSection
+            Divider()
             detailRows
             Divider()
             footer
@@ -401,7 +454,12 @@ struct StatusPopoverView: View {
         }
         .padding(16)
         .frame(width: 280)
-        .onAppear { alignSelectionWithMonitor() }
+        .onAppear {
+            alignSelectionWithMonitor()
+            refreshLoginStatus()
+            frequencyCount = String(Int(monitor.interval))
+            frequencyUnit = .seconds
+        }
     }
 
     private var header: some View {
@@ -480,6 +538,120 @@ struct StatusPopoverView: View {
         }
     }
 
+    // MARK: Settings (login item + frequency)
+
+    private var settingsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if supportsLoginItem {
+                Toggle("Launch at login", isOn: loginItemBinding)
+                    .toggleStyle(.switch)
+            }
+            frequencyEditor
+        }
+        .font(.callout)
+    }
+
+    /// SMAppService needs macOS 13+ and a bundled .app (not the bare
+    /// binary), so the toggle is hidden when unavailable.
+    private var supportsLoginItem: Bool {
+        if #available(macOS 13.0, *) { return Bundle.main.bundleURL.pathExtension == "app" }
+        return false
+    }
+
+    private var loginItemBinding: Binding<Bool> {
+        Binding(
+            get: { loginItemEnabled },
+            set: { setLoginItem(enabled: $0) }
+        )
+    }
+
+    private func setLoginItem(enabled: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            // Registration can fail (permission or bundle issues); revert
+            // to whatever the system thinks the state is.
+            NSSound.beep()
+        }
+        refreshLoginStatus()
+    }
+
+    private func refreshLoginStatus() {
+        if #available(macOS 13.0, *) {
+            loginItemEnabled = SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    private var frequencyEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Check frequency")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                TextField("5", text: $frequencyCount)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 52)
+                    .onChange(of: frequencyCount) { _ in sanitizeFrequencyText() }
+                    .onSubmit(applyFrequency)
+                Picker("Unit", selection: $frequencyUnit) {
+                    ForEach(FrequencyUnit.allCases) { unit in
+                        Text(unit.rawValue).tag(unit)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                Button("Apply", action: applyFrequency)
+                    .disabled(Int(trimmedFrequencyCount) == nil)
+            }
+            Text(frequencySummary)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var trimmedFrequencyCount: String {
+        frequencyCount.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Integer-only enforcement: anything that is not a digit is dropped.
+    private func sanitizeFrequencyText() {
+        let filtered = String(trimmedFrequencyCount.filter(\.isNumber))
+        if filtered != frequencyCount {
+            frequencyCount = filtered
+        }
+    }
+
+    private func applyFrequency() {
+        sanitizeFrequencyText()
+        guard let count = Int(trimmedFrequencyCount), count >= 1 else { return }
+        monitor.setInterval(seconds: frequencyUnit.seconds(forCount: count))
+    }
+
+    /// "Every 5 s (12×/min, 720×/hr)" — fractional rates get one decimal.
+    private var frequencySummary: String {
+        let seconds = monitor.interval
+        func rate(_ perInterval: Double) -> String {
+            let value = perInterval / seconds
+            return value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
+        }
+        var parts = ["Every \(seconds < 60 ? String(Int(seconds)) + " s" : Self.durationText(seconds))"]
+        parts.append("\(rate(60))×/min")
+        if seconds >= 60 { parts.append("\(rate(3600))×/hr") }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func durationText(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        if s >= 3600, s % 3600 == 0 { return "\(s / 3600) h" }
+        if s >= 60, s % 60 == 0 { return "\(s / 60) min" }
+        return "\(s) s"
+    }
+
     // MARK: Detail rows
 
     private var detailRows: some View {
@@ -512,7 +684,7 @@ struct StatusPopoverView: View {
     }
 
     private var footer: some View {
-        Text("Pinging \(monitor.host) every \(Int(PingMonitor.interval)) s")
+        Text("Pinging \(monitor.host) every \(Int(monitor.interval)) s")
             .font(.caption)
             .foregroundColor(.secondary)
             .frame(maxWidth: .infinity, alignment: .center)

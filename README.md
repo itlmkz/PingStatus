@@ -41,11 +41,17 @@ reaches the internet and comes back — the thing you actually care about.
 | Disconnected | red `circle` |
 | Checking (startup) | gray `circle.dashed` |
 
-- **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~500 lines
+- **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~600 lines
 - **Click the dot** for a popover: pick the ping target (google.com,
-  claude.ai, x.com, or a custom host/IP stored locally), see connection
-  status, response time (ms), last-check / last-success timestamps,
-  failure count and reason
+  claude.ai, x.com, or a custom host/IP stored locally), toggle **launch
+  at login**, set the **check frequency** (seconds, per minute, or per
+  hour), and see connection status, response time (ms), last-check /
+  last-success timestamps, failure count and reason
+- **Launch at login** toggle (macOS 13+, via `SMAppService` — no helper
+  process, no login-item scripts)
+- **Configurable frequency** — every 5 s by default; express it in seconds
+  ("every 10 s"), rate ("30 per minute"), or hourly rate ("4 per hour").
+  Any value snaps to whole seconds, 1 s to 1 h
 - Pings every 5 s via macOS's own `/sbin/ping` in a background process
 - **Pure menu bar app** — `LSUIElement = true`, never appears in the Dock
 - Tiny: ad-hoc signed `.app` bundle you build yourself in seconds
@@ -68,12 +74,8 @@ cp -R build/PingStatus.app /Applications/
 open /Applications/PingStatus.app    # or launch via Spotlight
 ```
 
-Optional — start at login:
-System Settings → General → Login Items → add PingStatus, or:
-
-```bash
-osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/PingStatus.app", hidden:true}'
-```
+Optional — start at login: use the **Launch at login** toggle in the
+popover (macOS 13+), or System Settings → General → Login Items.
 
 ## Build & run
 
@@ -83,6 +85,10 @@ make app     # just build
 make smoke   # run raw binary for 6 s and verify it stays alive
 make clean
 ```
+
+The app icon (`Contents/Resources/AppIcon.icns`) is generated at build
+time from `AppIcon.png` with the macOS built-ins `sips` + `iconutil` —
+replace the PNG and rebuild to change it.
 
 ## Configuration
 
@@ -97,6 +103,28 @@ Click the menu bar dot and pick a **Ping target** from the dropdown:
 The choice is stored locally (UserDefaults) and survives relaunches.
 Selecting a target re-checks immediately. Pasted URLs are sanitized
 automatically — `https://example.com/foo` becomes `example.com`.
+
+### Launch at login
+
+Flip the **Launch at login** switch in the popover (macOS 13+). It uses
+`SMAppService`, so the app manages itself as a login item — no helper
+processes and nothing to configure in System Settings. On macOS 12 the
+toggle is hidden; add the app to Login Items manually instead.
+
+### Check frequency
+
+The **Check frequency** row accepts an integer plus a unit:
+
+| You enter | Resulting interval |
+| --- | --- |
+| `5` seconds | every 5 s |
+| `30` per minute | every 2 s |
+| `4` per hour | every 15 min |
+
+Any rate is snapped to the nearest whole second (minimum 1 s, maximum
+1 h — i.e. `1` per hour). The current cadence is always shown underneath,
+e.g. "Every 5 s · 12×/min · 720×/hr". Applies immediately; persisted
+across relaunches.
 
 You can also set it from the terminal:
 
