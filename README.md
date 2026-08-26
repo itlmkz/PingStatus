@@ -1,18 +1,77 @@
 # PingStatus
 
-A macOS menu bar app that shows a **green dot** when `ping google.com`
-succeeds and a **red dot** when it doesn't. Single Swift file, SwiftUI +
-AppKit, no dependencies.
+> A tiny, elegant circle in your macOS menu bar that tells you whether your
+> internet **actually works** — green when pings go through, red when they don't.
 
-| State            | Icon                |
-| ---------------- | ------------------- |
-| Connected        | green `circle.fill` |
-| Disconnected     | red `circle`        |
+You're in an airport lounge. Your VPN app says *Connected*. Your browser
+spins anyway. Is it the Wi-Fi? The VPN tunnel? A dead DNS resolver? A
+captive portal you already "signed in" to?
+
+PingStatus cuts through all of it with one glance:
+
+- 🟢 **Green dot** — packets are flowing. Whatever chain of Wi-Fi, VPN, and
+  DNS you're on, it works.
+- 🔴 **Red dot** — pings are dying. Your VPN can *claim* you're connected,
+  but if the tunnel isn't routing, the dot knows.
+- ⚪ **Gray dot** — first check still running.
+
+No windows, no Dock icon, no settings page to hunt for. Just a circle that
+lives in your menu bar and tells the truth about your connection.
+
+## Why it exists
+
+Built for people who travel with a VPN always on:
+
+- **Hotel & airport Wi-Fi** that silently drops packets while looking
+  "connected"
+- **Half-dead VPN states** — the app shows green, the tunnel black-holes
+  everything
+- **Captive portals** that let one request through then trap the rest
+- **Flaky DNS** that resolves once and never again
+
+Most connectivity indicators (including macOS's own Wi-Fi icon) only tell
+you about your *local link*. PingStatus tells you whether data actually
+reaches the internet and comes back — the thing you actually care about.
+
+## Features
+
+| State | Icon |
+| ------------------- | ------------------- |
+| Connected | green `circle.fill` |
+| Disconnected | red `circle` |
 | Checking (startup) | gray `circle.dashed` |
 
-Click the icon for a popover with connection status, host, response time
-(ms), last-check / last-success timestamps, failure count + reason, and a
-Quit button. Pings run every 5 s via `/sbin/ping` in a background `Process`.
+- **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~450 lines
+- **Click the dot** for a popover: connection status, host, response time
+  (ms), last-check / last-success timestamps, failure count and reason
+- Pings every 5 s via macOS's own `/sbin/ping` in a background process
+- **Pure menu bar app** — `LSUIElement = true`, never appears in the Dock
+- Tiny: ad-hoc signed `.app` bundle you build yourself in seconds
+- MIT licensed
+
+## Install
+
+Requires macOS 12+ and Xcode Command Line Tools (`xcode-select --install`).
+
+```bash
+git clone https://github.com/itlmkz/PingStatus.git
+cd PingStatus
+make run        # builds and opens it
+```
+
+To keep it around permanently:
+
+```bash
+cp -R build/PingStatus.app /Applications/
+open /Applications/PingStatus.app    # or launch via Spotlight
+```
+
+Optional — start at login:
+System Settings → General → Login Items → add PingStatus, or:
+
+```bash
+osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/PingStatus.app", hidden:true}'
+```
 
 ## Build & run
 
@@ -23,23 +82,39 @@ make smoke   # run raw binary for 6 s and verify it stays alive
 make clean
 ```
 
-## Install
+## Configuration
 
-Copy the built bundle to /Applications and add it to Login Items if you
-want it at startup:
+By default the app pings `google.com` every 5 s. To watch a different host
+(your VPN's gateway, your own server, `1.1.1.1`…):
 
 ```bash
-cp -R build/PingStatus.app /Applications/
-open /Applications/PingStatus.app   # or launch via Spotlight
+# Bundled app — override persists via the bundle identifier:
+defaults write dev.mm.pingstatus Host 127.0.0.1
+
+# Raw binary — the domain is the executable name instead:
+defaults write PingStatus Host 127.0.0.1
+
+defaults delete dev.mm.pingstatus Host   # restore google.com
 ```
 
-(Hide the dot's app from the Dock is automatic — `LSUIElement = true`.)
+## How it tells "no internet" from "slow internet"
 
-Requirements: macOS 12+, Xcode Command Line Tools (`xcrun swiftc`).
+Each check runs `ping -c 1 -W 1000 <host>` (1 s timeout). Any outcome other
+than a successful reply — timeout, DNS failure, or the ping binary missing —
+surfaces as a failure with a human-readable reason in the popover. Response
+time is shown in the popover, so "500 ms but working" (slow VPN hop) is easy
+to distinguish from "no reply" (dead tunnel).
 
-## License
+## Reliability details
 
-[MIT](LICENSE) — free to use, modify, and redistribute.
+- Pings run on a serial background `DispatchQueue`; results are applied on
+  the main thread. An in-flight guard coalesces overlapping attempts.
+- Pipe output for a single ping (< 1 KiB) is far below the 64 KiB pipe
+  buffer, and is read **after** `waitUntilExit`, so no deadlock is possible.
+- Timer blocks and Combine sinks capture `[weak self]`; the timer is
+  invalidated in `deinit`; the status item is removed in `deinit`.
+- If SF Symbols were unavailable, the menu bar dot falls back to a
+  hand-drawn `NSBezierPath` circle.
 
 ## Design notes / deviations from a literal spec
 
@@ -62,30 +137,17 @@ Requirements: macOS 12+, Xcode Command Line Tools (`xcrun swiftc`).
 
 ## Testing on ICMP-blocked networks
 
-Some networks (including this one) block outbound ICMP — the app will
-correctly show red even though browsing works. To verify the app logic
-against a reachable host:
+Some networks block outbound ICMP — the app will correctly show red even
+though browsing works. Use the `Host` override above to point it at a
+reachable host (e.g. `1.1.1.1` or your VPN gateway) on such networks.
 
-```bash
-# Bundled app (make run) — override persists via the bundle identifier:
-defaults write dev.mm.pingstatus Host 127.0.0.1
+## License
 
-# Raw binary (run directly) — the domain is the executable name instead:
-defaults write PingStatus Host 127.0.0.1
+[MIT](LICENSE) — free to use, modify, and redistribute.
 
-defaults delete dev.mm.pingstatus Host   # restore google.com
-defaults delete PingStatus Host
-```
+---
 
-## Reliability details
-
-- Pings run on a serial background `DispatchQueue`; results are applied on
-  the main thread. An in-flight guard coalesces overlapping attempts.
-- Pipe output for a single ping (< 1 KiB) is far below the 64 KiB pipe
-  buffer, and is read **after** `waitUntilExit`, so no deadlock is possible.
-- Timer blocks and Combine sinks capture `[weak self]`; the timer is
-  invalidated in `deinit`; the status item is removed in `deinit`.
-- All failures (ping timeout, DNS failure, `/sbin/ping` missing) surface as
-  a `.failure` outcome with a human-readable reason shown in the popover.
-- If SF Symbols were unavailable, the menu bar dot falls back to a
-  hand-drawn `NSBezierPath` circle.
+*PingStatus — macOS menu bar internet connectivity indicator for travelers
+and VPN users: a menu bar app that monitors your connection with a periodic
+ping and shows a green or red dot so you always know if your network (or
+VPN tunnel) actually works.*
