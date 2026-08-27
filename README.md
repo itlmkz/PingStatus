@@ -1,7 +1,8 @@
 # PingStatus
 
 > A tiny, elegant circle in your macOS menu bar that tells you whether your
-> internet **actually works** — green when pings go through, red when they don't.
+> internet **actually works** — green when your target answers like a
+> browser, red when it doesn't.
 
 You're in an airport lounge. Your VPN app says *Connected*. Your browser
 spins anyway. Is it the Wi-Fi? The VPN tunnel? A dead DNS resolver? A
@@ -9,10 +10,11 @@ captive portal you already "signed in" to?
 
 PingStatus cuts through all of it with one glance:
 
-- 🟢 **Green dot** — packets are flowing. Whatever chain of Wi-Fi, VPN, and
-  DNS you're on, it works.
-- 🔴 **Red dot** — pings are dying. Your VPN can *claim* you're connected,
-  but if the tunnel isn't routing, the dot knows.
+- 🟢 **Green dot** — your target answers over HTTPS, like a browser.
+  Whatever chain of Wi-Fi, VPN, and DNS you're on, it works.
+- 🔴 **Red dot** — the check is dying: timeout, reset, DNS failure, or a
+  403/451 region block. Your VPN can *claim* you're connected, but if the
+  tunnel isn't routing, the dot knows.
 - ⚪ **Gray dot** — first check still running.
 
 No windows, no Dock icon, no settings page to hunt for. Just a circle that
@@ -30,8 +32,26 @@ Built for people who travel with a VPN always on:
 - **Flaky DNS** that resolves once and never again
 
 Most connectivity indicators (including macOS's own Wi-Fi icon) only tell
-you about your *local link*. PingStatus tells you whether data actually
-reaches the internet and comes back — the thing you actually care about.
+you about your *local link*. PingStatus checks the layer your browser
+actually uses — whether an HTTPS request reaches the site and comes back
+with a usable answer.
+
+## HTTPS checks, not just ping
+
+Plain ICMP ping measures the wrong thing for modern sites:
+
+| Situation | `ping` says | HTTPS check says |
+| --- | --- | --- |
+| Site region-blocked for you (403/451) | 🟢 reachable | 🔴 `HTTP 403 — blocked` |
+| VPN tunnel black-holes traffic | 🔴 (or 🟢 to the VPN's edge) | 🔴 `Timed out` |
+| DNS poisoning / wrong resolver | 🟢 (resolves somewhere) | 🔴 `TLS handshake failed` |
+| Site ignores ICMP (many CDNs) | 🔴 unreachable | 🟢 fine |
+
+That's why all built-in targets — `google.com`, `claude.ai`, `x.com` — are
+checked over **HTTPS**: same fetch a browser performs (redirects followed,
+realistic User-Agent, 5 s budget), final status below 400 = green. Custom
+targets can also use classic **ping** — the right tool for VPN gateways,
+LAN hosts, and `1.1.1.1`-style reachability.
 
 ## Features
 
@@ -42,11 +62,13 @@ reaches the internet and comes back — the thing you actually care about.
 | Checking (startup) | gray `circle.dashed` |
 
 - **Zero dependencies** — one Swift file, SwiftUI + AppKit, ~600 lines
-- **Click the dot** for a popover: pick the ping target (google.com,
-  claude.ai, x.com, or a custom host/IP stored locally), toggle **launch
-  at login**, set the **check frequency** (seconds, per minute, or per
-  hour), and see connection status, response time (ms), last-check /
-  last-success timestamps, failure count and reason
+- **Click the dot** for a popover: pick the target (google.com, claude.ai,
+  x.com, or a custom host/IP stored locally) and its check method (HTTPS or
+  ping for custom targets), toggle **launch at login**, set the **check
+  frequency** (seconds, per minute, or per hour), and see connection status,
+  response time (ms), last-check / last-success timestamps, failure count
+  and a human-readable reason (`HTTP 403 — blocked`, `Timed out`, `TLS
+  handshake failed`…)
 - **Launch at login** toggle (macOS 13+, via `SMAppService` — no helper
   process, no login-item scripts)
 - **Configurable frequency** — every 5 s by default; express it in seconds
@@ -92,17 +114,18 @@ replace the PNG and rebuild to change it.
 
 ## Configuration
 
-Click the menu bar dot and pick a **Ping target** from the dropdown:
+Click the menu bar dot and pick a **Target** from the dropdown:
 
-- `google.com` (default)
-- `claude.ai`
-- `x.com`
-- **Custom…** — type any host or IP (e.g. `1.1.1.1` or your VPN gateway)
-  and hit Return or Save
+- `google.com` (default) — HTTPS
+- `claude.ai` — HTTPS
+- `x.com` — HTTPS
+- **Custom…** — type any host or IP (e.g. `1.1.1.1` or your VPN gateway),
+  pick the check method (**HTTPS | ping**), and hit Return or Save
 
-The choice is stored locally (UserDefaults) and survives relaunches.
-Selecting a target re-checks immediately. Pasted URLs are sanitized
-automatically — `https://example.com/foo` becomes `example.com`.
+The choice is stored locally (UserDefaults) and survives relaunches; each
+custom host remembers its own method. Selecting a target re-checks
+immediately. Pasted URLs are sanitized automatically —
+`https://example.com/foo` becomes `example.com`.
 
 ### Launch at login
 
@@ -131,6 +154,7 @@ You can also set it from the terminal:
 ```bash
 # Bundled app — override persists via the bundle identifier:
 defaults write dev.mm.pingstatus Host 127.0.0.1
+defaults write dev.mm.pingstatus Method.127.0.0.1 ping   # ping instead of HTTPS
 
 # Raw binary — the domain is the executable name instead:
 defaults write PingStatus Host 127.0.0.1
@@ -138,13 +162,16 @@ defaults write PingStatus Host 127.0.0.1
 defaults delete dev.mm.pingstatus Host   # restore google.com
 ```
 
-## How it tells "no internet" from "slow internet"
+## How a check works
 
-Each check runs `ping -c 1 -W 1000 <host>` (1 s timeout). Any outcome other
-than a successful reply — timeout, DNS failure, or the ping binary missing —
-surfaces as a failure with a human-readable reason in the popover. Response
-time is shown in the popover, so "500 ms but working" (slow VPN hop) is easy
-to distinguish from "no reply" (dead tunnel).
+- **HTTPS mode** — `curl -sL -m 5` with a browser User-Agent fetches
+  `https://<host>/`; the final HTTP status after redirects decides the
+  verdict (below 400 = connected). Total time is shown as the response
+  time, so "800 ms but working" (slow VPN hop) is easy to distinguish from
+  a hard failure.
+- **ping mode** — `ping -c 1 -W 1000 <host>` (1 s timeout). Any outcome
+  other than a successful reply — timeout, DNS failure, or the binary
+  missing — is a failure with a readable reason.
 
 ## Reliability details
 
@@ -178,9 +205,10 @@ to distinguish from "no reply" (dead tunnel).
 
 ## Testing on ICMP-blocked networks
 
-Some networks block outbound ICMP — the app will correctly show red even
-though browsing works. Use the `Host` override above to point it at a
-reachable host (e.g. `1.1.1.1` or your VPN gateway) on such networks.
+Some networks block outbound ICMP — in **ping** mode the app will show red
+even though browsing works (the table above's last row, inverted). Switch
+the target to HTTPS mode, or use HTTPS-mode presets, on such networks; keep
+**ping** for targets you know answer ICMP (your VPN gateway, LAN hosts).
 
 ## License
 

@@ -43,10 +43,37 @@ enum PingOutcome: Equatable {
     case failure(String)
 }
 
-// MARK: - Ping monitor
+/// How a target is checked.
+///
+/// - `https`: fetch `https://host/` with curl (browser User-Agent,
+///   redirects followed). Any final HTTP status below 400 is connected —
+///   this sees what the *browser* sees, including region blocks (403/451),
+///   TLS resets, and DNS poisoning that leave ICMP ping green.
+/// - `ping`: classic ICMP echo via `/sbin/ping`. Right tool for VPN
+///   gateways, LAN hosts, and raw reachability.
+enum CheckMethod: String, CaseIterable {
+    case https
+    case ping
 
-/// Pings a host every `interval` seconds on a background queue using
-/// `/sbin/ping` and publishes the results on the main thread.
+    var label: String {
+        switch self {
+        case .https: return "HTTPS"
+        case .ping: return "ping"
+        }
+    }
+}
+
+/// A built-in target offered in the popover picker.
+struct PresetHost: Equatable {
+    let host: String
+    let method: CheckMethod
+}
+
+// MARK: - Check monitor
+
+/// Checks a host every `interval` seconds on a background queue — an
+/// HTTPS fetch via `/usr/bin/curl` (browser-like) or an ICMP echo via
+/// `/sbin/ping` — and publishes the results on the main thread.
 final class PingMonitor: ObservableObject {
 
     // MARK: Configuration
@@ -58,18 +85,18 @@ final class PingMonitor: ObservableObject {
     private static let pingExecutablePath = "/sbin/ping"
     private static let defaultHost = "google.com"
 
-    /// Seconds between pings. Persisted (`IntervalSeconds`), default 5;
-    /// set from the popover's frequency editor (seconds / per minute /
-    /// per hour), always snapped to an integer number of seconds.
-    @Published private(set) var interval: TimeInterval = 5
+    /// Built-in targets. All use HTTPS: it is the layer the browser
+    /// actually experiences (a plain ping can be green while the site is
+    /// region-blocked, and ICMP is often deprioritized or ignored).
+    static let presetHosts = [
+        PresetHost(host: "google.com", method: .https),
+        PresetHost(host: "claude.ai", method: .https),
+        PresetHost(host: "x.com", method: .https),
+    ]
 
-    /// Built-in choices offered in the popover picker.
-    static let presetHosts = ["google.com", "claude.ai", "x.com"]
-
-    /// Host to ping. The current value persists in UserDefaults (`Host`);
-    /// override for testing with `defaults write dev.mm.pingstatus Host 127.0.0.1`.
-    /// Anything outside `presetHosts` is treated as a custom host.
-    @Published private(set) var host: String
+    /// Method for the current host. Presets carry a fixed method; custom
+    /// hosts persist theirs per-host (`Method.<host>`, default HTTPS).
+    @Published private(set) var method: CheckMethod = .https
 
     // MARK: Published state (main thread only)
 
@@ -101,10 +128,20 @@ final class PingMonitor: ObservableObject {
         pattern: #"time=(\d+(?:\.\d+)?)\s*ms"#
     )
 
+    /// Host to check. The current value persists in UserDefaults (`Host`);
+    /// override for testing with `defaults write dev.mm.pingstatus Host 127.0.0.1`.
+
+    /// Seconds between checks. Persisted (`IntervalSeconds`), default 5;
+    /// set from the popover's frequency editor (seconds / per minute /
+    /// per hour), always snapped to an integer number of seconds.
+    @Published private(set) var interval: TimeInterval = 5
+    @Published private(set) var host: String
+
     init(host: String? = nil) {
         self.host = host
             ?? UserDefaults.standard.string(forKey: "Host")
             ?? Self.defaultHost
+        method = Self.method(forHost: self.host)
         let storedInterval = UserDefaults.standard.integer(forKey: "IntervalSeconds")
         if (1...3600).contains(storedInterval) {
             interval = TimeInterval(storedInterval)
@@ -124,6 +161,7 @@ final class PingMonitor: ObservableObject {
         let newHost = Self.sanitizeHost(rawHost)
         guard !newHost.isEmpty, newHost != host else { return }
         host = newHost
+        method = Self.method(forHost: newHost)
         UserDefaults.standard.set(newHost, forKey: "Host")
         pingGeneration += 1
         state = .checking
@@ -132,6 +170,32 @@ final class PingMonitor: ObservableObject {
         lastResponseMillis = nil
         lastSuccessDate = nil
         pingNow()
+    }
+
+    /// Switches the check method for a *custom* host (presets are fixed),
+    /// persists it, and re-checks immediately.
+    func setMethod(_ newMethod: CheckMethod) {
+        guard Self.preset(for: host) == nil, newMethod != method else { return }
+        method = newMethod
+        UserDefaults.standard.set(newMethod.rawValue, forKey: "Method.\(host)")
+        state = .checking
+        pingNow()
+    }
+
+    /// The preset whose host matches, if any.
+    private static func preset(for host: String) -> PresetHost? {
+        presetHosts.first { $0.host == host }
+    }
+
+    /// Method for a host: the preset's fixed method if it is one, otherwise
+    /// the per-host stored choice, defaulting to HTTPS.
+    private static func method(forHost host: String) -> CheckMethod {
+        if let preset = preset(for: host) { return preset.method }
+        if let stored = UserDefaults.standard.string(forKey: "Method.\(host)"),
+           let parsed = CheckMethod(rawValue: stored) {
+            return parsed
+        }
+        return .https
     }
 
     /// Updates the ping cadence in whole seconds (clamped to 1...3600),
@@ -190,8 +254,11 @@ final class PingMonitor: ObservableObject {
         pingGeneration += 1
         let generation = pingGeneration
         let currentHost = host
+        let currentMethod = method
         pingQueue.async { [weak self] in
-            let outcome = Self.performPing(host: currentHost)
+            let outcome = currentMethod == .https
+                ? Self.performHTTPS(host: currentHost)
+                : Self.performPing(host: currentHost)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isPinging = false
@@ -255,6 +322,89 @@ final class PingMonitor: ObservableObject {
             return nil
         }
         return Double(text.substring(with: match.range(at: 1)))
+    }
+
+    // MARK: HTTPS check (curl)
+
+    private static let curlExecutablePath = "/usr/bin/curl"
+    private static let curlUserAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        + "(KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    /// Total budget for the whole fetch, redirects included (seconds).
+    private static let curlTimeoutSeconds = 5.0
+
+    /// Fetches `https://<host>/` with curl — browser User-Agent, redirects
+    /// followed, shared 5 s budget — and maps the final HTTP status to an
+    /// outcome: below 400 is connected; 403/451 (region/bot block), timeouts,
+    /// resets, and DNS failures are failures with a readable reason.
+    /// Must be called off the main thread. Output is under 1 KiB, read
+    /// after `waitUntilExit`, so no pipe deadlock is possible.
+    private static func performHTTPS(host: String) -> PingOutcome {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: curlExecutablePath)
+        process.arguments = [
+            "-s", "-o", "/dev/null", "-L",
+            "-m", String(curlTimeoutSeconds),
+            "--connect-timeout", String(curlTimeoutSeconds - 1),
+            "-A", curlUserAgent,
+            "-w", "%{http_code} %{time_total}",
+            "https://\(host)/",
+        ]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+        } catch {
+            return .failure("Could not launch \(curlExecutablePath): \(error.localizedDescription)")
+        }
+
+        process.waitUntilExit()
+
+        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard process.terminationStatus == 0 else {
+            return .failure(curlFailureReason(
+                exitCode: Int(process.terminationStatus), host: host))
+        }
+
+        // "301 0.456" → status 301, total time 0.456 s.
+        let parts = output.split(separator: " ")
+        guard let code = parts.first.flatMap({ Int($0) }), code > 0 else {
+            return .failure("Could not read HTTP status from curl output")
+        }
+        let millis = parts.count > 1 ? Double(parts[1]).map { $0 * 1000 } : nil
+
+        guard code < 400 else {
+            return .failure(httpFailureReason(code: code))
+        }
+        return .success(responseMillis: millis)
+    }
+
+    private static func curlFailureReason(exitCode: Int, host: String) -> String {
+        switch exitCode {
+        case 6: return "Could not resolve \(host) (DNS)"
+        case 7: return "Could not connect to \(host)"
+        case 28: return "Timed out reaching \(host)"
+        case 35: return "TLS handshake failed for \(host)"
+        case 47, 54, 56: return "Connection reset while loading \(host)"
+        case 60: return "TLS certificate problem for \(host)"
+        default: return "curl exited with status \(exitCode)"
+        }
+    }
+
+    private static func httpFailureReason(code: Int) -> String {
+        switch code {
+        case 401, 403: return "HTTP \(code) — blocked (region or bot check)"
+        case 451: return "HTTP 451 — unavailable in this region"
+        case 404: return "HTTP 404 — not found"
+        case 500...599: return "HTTP \(code) — server error"
+        default: return "HTTP \(code)"
+        }
     }
 
     // MARK: State application (main thread)
@@ -420,8 +570,9 @@ enum FrequencyUnit: String, CaseIterable, Identifiable {
 struct StatusPopoverView: View {
     @EnvironmentObject private var monitor: PingMonitor
 
-    @State private var selection: HostChoice = .preset(PingMonitor.presetHosts[0])
+    @State private var selection: HostChoice = .preset(PingMonitor.presetHosts[0].host)
     @State private var customHostText = ""
+    @State private var customMethod: CheckMethod = .https
     @State private var loginItemEnabled = false
     @State private var frequencyCount = ""
     @State private var frequencyUnit: FrequencyUnit = .seconds
@@ -477,12 +628,12 @@ struct StatusPopoverView: View {
 
     private var hostPicker: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Ping target")
+            Text("Target")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Picker("Ping target", selection: selectionBinding) {
-                ForEach(PingMonitor.presetHosts, id: \.self) { host in
-                    Text(host).tag(HostChoice.preset(host))
+            Picker("Target", selection: selectionBinding) {
+                ForEach(PingMonitor.presetHosts, id: \.host) { preset in
+                    Text(preset.host).tag(HostChoice.preset(preset.host))
                 }
                 Text("Custom…").tag(HostChoice.custom)
             }
@@ -497,6 +648,13 @@ struct StatusPopoverView: View {
                     Button("Save", action: saveCustomHost)
                         .disabled(trimmedCustomHost.isEmpty)
                 }
+                Picker("Check with", selection: $customMethod) {
+                    ForEach(CheckMethod.allCases, id: \.self) { method in
+                        Text(method.label).tag(method)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 160)
             }
         }
         .font(.callout)
@@ -524,17 +682,19 @@ struct StatusPopoverView: View {
         let host = trimmedCustomHost
         guard !host.isEmpty else { return }
         monitor.setHost(host)
+        monitor.setMethod(customMethod)
     }
 
     /// Mirrors the persisted host into the picker: a preset if it matches,
     /// otherwise Custom… with the stored value shown in the text field.
     private func alignSelectionWithMonitor() {
-        if let preset = PingMonitor.presetHosts.first(where: { $0 == monitor.host }) {
-            selection = .preset(preset)
+        if let preset = PingMonitor.presetHosts.first(where: { $0.host == monitor.host }) {
+            selection = .preset(preset.host)
             customHostText = ""
         } else {
             selection = .custom
             customHostText = monitor.host
+            customMethod = monitor.method
         }
     }
 
@@ -656,6 +816,7 @@ struct StatusPopoverView: View {
 
     private var detailRows: some View {
         VStack(alignment: .leading, spacing: 6) {
+            row("Check") { Text(monitor.method.label) }
             row("Response") {
                 if let millis = monitor.lastResponseMillis {
                     Text(String(format: "%.1f ms", millis))
@@ -684,7 +845,7 @@ struct StatusPopoverView: View {
     }
 
     private var footer: some View {
-        Text("Pinging \(monitor.host) every \(Int(monitor.interval)) s")
+        Text("\(monitor.method == .https ? "Checking" : "Pinging") \(monitor.host) every \(Int(monitor.interval)) s")
             .font(.caption)
             .foregroundColor(.secondary)
             .frame(maxWidth: .infinity, alignment: .center)
