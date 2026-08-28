@@ -69,6 +69,9 @@ LAN hosts, and `1.1.1.1`-style reachability.
   response time (ms), last-check / last-success timestamps, failure count
   and a human-readable reason (`HTTP 403 — blocked`, `Timed out`, `TLS
   handshake failed`…)
+- **Speed test** (on demand) — one click measures real download
+  throughput through your current network/VPN via Cloudflare's free
+  public endpoint; the last result and its age stay in the popover
 - **Launch at login** toggle (macOS 13+, via `SMAppService` — no helper
   process, no login-item scripts)
 - **Configurable frequency** — every 5 s by default; express it in seconds
@@ -173,6 +176,22 @@ defaults delete dev.mm.pingstatus Host   # restore google.com
   other than a successful reply — timeout, DNS failure, or the binary
   missing — is a failure with a readable reason.
 
+## Speed test
+
+The popover's **Speed test** button measures real download throughput —
+the number a green dot can't tell you ("connected" at 2 Mbps is not the
+same as usable):
+
+- Two-stage curl download from `speed.cloudflare.com` — the same free,
+  keyless, no-account endpoint that powers Cloudflare's own speed test
+- A 1 MB probe sizes the real burst for ~5 s of data (2–50 MB): fast
+  links aren't wasted on, slow VPNs still get an accurate figure
+- Result persists across launches: "↓ 24 Mbps · 3 min ago"
+- Number is tinted: green ≥ 25 Mbps, orange ≥ 5, red below — a quick
+  "is my VPN degraded?" read
+- Never runs on a schedule: each test moves real megabytes through your
+  link (relevant on metered hotel/airplane Wi-Fi)
+
 ## Reliability details
 
 - Pings run on a serial background `DispatchQueue`; results are applied on
@@ -202,6 +221,13 @@ defaults delete dev.mm.pingstatus Host   # restore google.com
    `Info.plist` (primary), plus `NSApp.setActivationPolicy(.accessory)` in
    `applicationDidFinishLaunching` so the raw binary also stays out of the
    Dock when run outside the bundle.
+
+4. **Popover close is belt and braces.** The popover uses AppKit's
+   `.transient` behavior, plus explicit local + global mouse-down monitors
+   so *any* click outside the popover closes it deterministically — even
+   when a focused text field or an open dropdown menu would defeat the
+   default behavior. Clicks on menu windows (picker dropdowns) and on the
+   status icon itself (which toggles) are exempted.
 
 ## Testing on ICMP-blocked networks
 

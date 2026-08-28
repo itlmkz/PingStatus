@@ -146,6 +146,13 @@ final class PingMonitor: ObservableObject {
         if (1...3600).contains(storedInterval) {
             interval = TimeInterval(storedInterval)
         }
+        if let storedSpeed = UserDefaults.standard.object(forKey: "LastSpeedMbps") as? Double {
+            lastSpeedMbps = storedSpeed
+            let storedDate = UserDefaults.standard.double(forKey: "LastSpeedDate")
+            if storedDate > 0 {
+                lastSpeedDate = Date(timeIntervalSince1970: storedDate)
+            }
+        }
     }
 
     deinit {
@@ -407,6 +414,125 @@ final class PingMonitor: ObservableObject {
         }
     }
 
+    // MARK: Speed test (download throughput via curl)
+
+    /// Public, keyless endpoint that powers speed.cloudflare.com itself.
+    private static let speedTestURL = "https://speed.cloudflare.com/__down?bytes="
+    private static let speedProbeBytes = 1_000_000
+    /// The burst is sized to run about this long: long enough for a stable
+    /// average, short enough not to waste data on fast links.
+    private static let speedTestTargetDuration: TimeInterval = 5
+    private static let speedTestMinBytes = 2_000_000
+    private static let speedTestMaxBytes = 50_000_000
+    private static let speedProbeTimeout: TimeInterval = 6
+    private static let speedBurstTimeout: TimeInterval = 12
+
+    /// Serialized so two tests can never overlap each other (connectivity
+    /// checks continue on their own queue meanwhile).
+    private let speedQueue = DispatchQueue(label: "dev.mm.pingstatus.speed", qos: .utility)
+
+    @Published private(set) var speedTestRunning = false
+    @Published private(set) var lastSpeedMbps: Double?
+    @Published private(set) var lastSpeedDate: Date?
+    @Published private(set) var speedTestError: String?
+
+    /// Two-stage download test: a 1 MB probe estimates the link, then a
+    /// burst sized for ~5 s (2–50 MB) measures throughput. The result is
+    /// persisted across launches. A test moves real megabytes through the
+    /// current network/VPN — that is why it is a button, never scheduled.
+    func runSpeedTest() {
+        guard !speedTestRunning else { return }
+        speedTestRunning = true
+        speedTestError = nil
+        speedQueue.async { [weak self] in
+            guard let self else { return }
+
+            let probe = Self.downloadForSpeedTest(
+                bytes: Self.speedProbeBytes, timeout: Self.speedProbeTimeout)
+            guard let probeBytesPerSec = probe.bytesPerSecond, probeBytesPerSec > 0 else {
+                DispatchQueue.main.async {
+                    self.finishSpeedTest(mbps: nil, error: probe.error ?? "Speed test failed")
+                }
+                return
+            }
+
+            let burstBytes = min(
+                max(Int(probeBytesPerSec * Self.speedTestTargetDuration), Self.speedTestMinBytes),
+                Self.speedTestMaxBytes)
+            let burst = Self.downloadForSpeedTest(
+                bytes: burstBytes, timeout: Self.speedBurstTimeout)
+
+            DispatchQueue.main.async {
+                if let bytesPerSec = burst.bytesPerSecond {
+                    self.finishSpeedTest(mbps: bytesPerSec * 8 / 1_000_000, error: nil)
+                } else {
+                    self.finishSpeedTest(mbps: nil, error: burst.error ?? "Speed test failed")
+                }
+            }
+        }
+    }
+
+    /// Main-thread completion: persist on success, surface reason on failure.
+    private func finishSpeedTest(mbps: Double?, error: String?) {
+        speedTestRunning = false
+        if let mbps {
+            lastSpeedMbps = mbps
+            lastSpeedDate = Date()
+            UserDefaults.standard.set(mbps, forKey: "LastSpeedMbps")
+            UserDefaults.standard.set(lastSpeedDate!.timeIntervalSince1970, forKey: "LastSpeedDate")
+            speedTestError = nil
+        } else {
+            speedTestError = error
+        }
+    }
+
+    /// One timed download. Returns bytes/second, or an error. Even when the
+    /// timeout caps the transfer, a meaningful partial download still yields
+    /// a measurement. Must be called off the main thread.
+    private static func downloadForSpeedTest(
+        bytes: Int, timeout: TimeInterval
+    ) -> (bytesPerSecond: Double?, error: String?) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: curlExecutablePath)
+        process.arguments = [
+            "-s", "-o", "/dev/null",
+            "-m", String(timeout),
+            "--connect-timeout", String(timeout - 1),
+            "-A", curlUserAgent,
+            "-w", "%{speed_download} %{size_download}",
+            "\(speedTestURL)\(bytes)",
+        ]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+        } catch {
+            return (nil, "Could not launch \(curlExecutablePath)")
+        }
+        process.waitUntilExit()
+
+        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = output.split(separator: " ")
+        let speed = parts.first.flatMap { Double($0) }
+        let size = parts.count > 1 ? Double(parts[1]) ?? 0 : 0
+
+        if process.terminationStatus == 0, let speed, speed > 0 {
+            return (speed, nil)
+        }
+        // Exit 28 = hit the -m cap mid-transfer; if a meaningful chunk
+        // arrived, the partial average is still a valid measurement.
+        if process.terminationStatus == 28, let speed, size >= 100_000 {
+            return (speed, nil)
+        }
+        return (nil, curlFailureReason(
+            exitCode: Int(process.terminationStatus), host: "speed.cloudflare.com"))
+    }
+
     // MARK: State application (main thread)
 
     private func apply(_ outcome: PingOutcome, at date: Date) {
@@ -447,6 +573,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
 
     deinit {
         stateCancellable?.cancel()
+        removeClickOutsideMonitors()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
@@ -531,11 +658,65 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             button.highlight(true)
+            installClickOutsideMonitors()
         }
     }
 
     func popoverDidClose(_ notification: Notification) {
         statusItem?.button?.highlight(false)
+        removeClickOutsideMonitors()
+    }
+
+    // MARK: Click-outside handling
+
+    private var clickOutsideMonitors: [Any] = []
+
+    /// `.transient` behavior already closes the popover on outside
+    /// interaction, but a focused SwiftUI text field or an open menu can
+    /// defeat it. These monitors make the guarantee deterministic: any
+    /// mouse-down outside the popover (and outside the status button,
+    /// whose own action toggles) closes it.
+    private func installClickOutsideMonitors() {
+        removeClickOutsideMonitors()
+        let masks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        if let local = NSEvent.addLocalMonitorForEvents(matching: masks, handler: { [weak self] event in
+            self?.closePopoverIfClickOutside(event)
+            return event
+        }) {
+            clickOutsideMonitors.append(local)
+        }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: masks, handler: { [weak self] event in
+            self?.closePopoverIfClickOutside(event)
+        }) {
+            clickOutsideMonitors.append(global)
+        }
+    }
+
+    private func removeClickOutsideMonitors() {
+        clickOutsideMonitors.forEach { NSEvent.removeMonitor($0) }
+        clickOutsideMonitors = []
+    }
+
+    private func closePopoverIfClickOutside(_ event: NSEvent) {
+        guard popover.isShown else { return }
+        // An open picker dropdown lives in its own NSMenu window — closing
+        // here would kill the menu the user is choosing from.
+        if let window = event.window,
+           String(describing: type(of: window)).contains("Menu") {
+            return
+        }
+        let click = NSEvent.mouseLocation
+        if let popoverFrame = popover.contentViewController?.view.window?.frame,
+           popoverFrame.contains(click) {
+            return
+        }
+        // Clicks on the status button toggle via its own action; closing
+        // here as well would make that toggle reopen the popover.
+        if let buttonWindow = statusItem?.button?.window,
+           buttonWindow.frame.contains(click) {
+            return
+        }
+        popover.performClose(nil)
     }
 }
 
@@ -593,6 +774,8 @@ struct StatusPopoverView: View {
             settingsSection
             Divider()
             detailRows
+            Divider()
+            speedSection
             Divider()
             footer
             Button {
@@ -842,6 +1025,53 @@ struct StatusPopoverView: View {
             }
         }
         .font(.callout)
+    }
+
+    // MARK: Speed test
+
+    private static let relativeTimeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+
+    private var speedSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                if monitor.speedTestRunning {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Testing…")
+                        .foregroundColor(.secondary)
+                } else {
+                    Button("Speed test") { monitor.runSpeedTest() }
+                }
+                Spacer()
+                if let mbps = monitor.lastSpeedMbps {
+                    Text("↓ \(String(format: "%.0f", mbps)) Mbps")
+                        .font(.headline.monospacedDigit())
+                        .foregroundColor(Self.speedColor(mbps))
+                }
+            }
+            if let mbps = monitor.lastSpeedMbps, let date = monitor.lastSpeedDate {
+                Text("\(String(format: "%.0f", mbps)) Mbps · \(Self.relativeTimeFormatter.localizedString(for: date, relativeTo: Date())) · each test moves a few MB")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            if let error = monitor.speedTestError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .font(.callout)
+    }
+
+    /// Cosmetic tiering: comfortably usable / usable / painful.
+    private static func speedColor(_ mbps: Double) -> Color {
+        if mbps >= 25 { return .green }
+        if mbps >= 5 { return .orange }
+        return .red
     }
 
     private var footer: some View {
